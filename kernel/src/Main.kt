@@ -30,6 +30,7 @@ import kraos.kernel.PAGE_SIZE
 import kraos.kernel.PhysicalMemory
 import kraos.desktop.Desktop
 import kraos.desktop.Keyboard
+import kraos.desktop.Input
 import kraos.desktop.Keyboard.desktopApp
 import kraos.platform.writeU64
 
@@ -172,15 +173,42 @@ fun main() {
     }
 
     if (desktopFramebuffer != null) {
-        writeLine("[desktop] shortcuts: 1 Terminal, 2 Files, 3 Notes, 4 Settings, 5 About; Esc Overview")
+        writeLine(if (Input.mouseReady) "[input] PS/2 mouse ready" else "[input] PS/2 mouse unavailable; keyboard remains active")
+        writeLine("[desktop] mouse: click dock/shortcuts; keyboard: 1-5 apps, Esc Overview")
+        var oldX = Input.mouseX
+        var oldY = Input.mouseY
+        var oldButtons = Input.buttons
         while (true) {
-            val scanCode = Keyboard.pollMakeCode()
-            if (scanCode >= 0) {
-                val app = desktopApp(scanCode)
-                if (app != null && Desktop.selectApp(app)) {
-                    write("[desktop] foreground app = ")
-                    writeNumber(app.toLong())
+            Input.poll(Desktop.inputWidth, Desktop.inputHeight)
+            if (Input.mouseX != oldX || Input.mouseY != oldY) {
+                Desktop.movePointer(Input.mouseX, Input.mouseY)
+                oldX = Input.mouseX
+                oldY = Input.mouseY
+            }
+            val leftPressed = (Input.buttons and 1) != 0 && (oldButtons and 1) == 0
+            if (leftPressed) {
+                val clickedApp = Desktop.click(Input.mouseX, Input.mouseY)
+                if (clickedApp != null) {
+                    write("[desktop] mouse opened app = ")
+                    writeNumber(clickedApp.toLong())
                     writeLine("")
+                }
+            }
+            oldButtons = Input.buttons
+
+            val key = Keyboard.pollKey()
+            if (key >= 0) {
+                if (key != 27 && Desktop.foregroundApp == 3) {
+                    Desktop.handleNoteKey(key)
+                } else if (key != 27 && Desktop.foregroundApp == 1) {
+                    Desktop.handleTerminalKey(key)
+                } else {
+                    val app = desktopApp(key)
+                    if (app != null && Desktop.selectApp(app)) {
+                        write("[desktop] keyboard opened app = ")
+                        writeNumber(app.toLong())
+                        writeLine("")
+                    }
                 }
             }
         }

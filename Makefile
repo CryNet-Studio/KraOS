@@ -124,12 +124,12 @@ $(ISO): $(BUILD)/iso/boot/grub/i386-pc/eltorito.img
 
 iso: $(ISO)
 
-# P3 之前内核不带调度器，跑完 main() 会停机，所以 -no-reboot 收场。
+# 用 QEMU 图形窗口显示 Multiboot2 framebuffer；串口日志继续输出到当前终端。
 run: $(ISO)
 	qemu-system-x86_64 \
-		-machine pc -m 256M \
+		-machine pc -cpu max -m 256M \
 		-cdrom $(ISO) -boot d \
-		-vga std -serial stdio -nic none -no-reboot
+		-display gtk -vga std -serial stdio -nic none -no-reboot
 
 # 验收检查：P1 的三条硬指标都要在这里被真的断言，而不是「打印出来看着像」。
 #

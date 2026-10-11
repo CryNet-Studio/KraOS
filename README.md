@@ -4,9 +4,11 @@ KraOS 是一个用 **Kotlin/Native（Konan）** 写的 **x86_64 裸机操作系�
 内核没有 Linux 用户态：没有解释器、没有 `PT_INTERP`、没有动态链接段，
 `make check` 会把这件事当成硬指标来断言。
 
-它不是 Linux 发行版，也不是宿主环境中的桌面 Demo。当前处于**内核地基与早期桌面阶段**：
-引导链、Kotlin framebuffer 桌面首屏与键盘应用切换已跑通；窗口管理、可编辑终端/文件、
-鼠标、驱动和持久文件系统仍在实现中。
+它不是 Linux 发行版，也不是宿主环境中的桌面 Demo。当前处于**内核地基与桌面原型阶段**：
+Kotlin 软件 framebuffer 已请求并验证 1920×1080 RGB 显示，支持平滑字形、PS/2 鼠标指针、
+点击 dock/快捷图标和键盘应用切换。Notes 已可编辑并保留到本次关机；Terminal 支持 `help`、`ls`、
+`cat README.txt`、`cat notes.txt`、`about`、`clear` 等 RAM 命令。桌面仍是单窗口原型；可拖动多窗口、
+可写文件、持久文件系统以及真实硬件驱动仍在实现中。
 
 ---
 
@@ -16,7 +18,7 @@ KraOS 是一个用 **Kotlin/Native（Konan）** 写的 **x86_64 裸机操作系�
 cd KraOS
 
 make          # 构建（约 2–3 分钟）
-make run      # 在 QEMU 里启动，串口输出直接打在终端
+make run      # 打开 QEMU 桌面窗口；串口启动日志仍输出到终端
 make check    # 验收断言：无 PT_INTERP / 入口链 / 无动态段 / 无 ifunc 桩
 ```
 
@@ -24,8 +26,13 @@ make check    # 验收断言：无 PT_INTERP / 入口链 / 无动态段 / 无 if
 
 ```bash
 qemu-system-x86_64 -machine pc -cpu max -m 256M \
-  -cdrom build/kraos.iso -boot d -display none -serial stdio -nic none -no-reboot
+  -cdrom build/kraos.iso -boot d -display gtk -vga std \
+  -serial stdio -nic none -no-reboot
 ```
+
+桌面当前请求 **1920×1080×32 RGB**；显卡不支持时 GRUB 可以回退到其可用模式。
+鼠标左键可点击 dock 和桌面快捷图标，键盘 `1`–`5` 切换应用，`Esc` 回 Overview。Notes 中 Enter 换行、Backspace 删除；Terminal 中 Enter 执行命令、Backspace 删除。
+现阶段仍是单窗口原型，并非完整窗口管理器或持久文件浏览器。
 
 启动后串口上应当看到：
 

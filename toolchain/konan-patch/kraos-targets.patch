@@ -1,0 +1,616 @@
+ kraos-targets.patch — KraOS 对 Kotlin/Native 的源码级改动
+ ==========================================================
+
+ 相对上游 v2.1.21 纯净树。为便于复核，顶部附了一份改动清单。
+
+ 新增目标：kraos_kernel（freestanding 内核）、kraos（KraELF 用户态，占位）。
+ 详见 KraOS/toolchain/konan-patch/README.md。
+
+--- a/native/utils/src/org/jetbrains/kotlin/konan/target/KonanTarget.kt
++++ b/native/utils/src/org/jetbrains/kotlin/konan/target/KonanTarget.kt
+@@ -42,6 +42,28 @@
+     object LINUX_ARM32_HFP : KonanTarget("linux_arm32_hfp", Family.LINUX, Architecture.ARM32)
+ 
+     /**
++     * KraOS 用户态目标：编译出 **KraELF**（KraOS 自有可执行格式，携带段表/重定位/符号，
++     * 不走 ELF+PT_INTERP+动态链接器那套）。
++     *
++     * 复用 [Family.LINUX] 而非新增 Family：K/N 的工具链查找、sysroot 解析、
++     * 库选择等大量逻辑按 Family 分派，新增 Family 会牵连到编译器里所有
++     * `when (family)` 的穷尽分支。KraOS 与 Linux 的差异全部由 konan.properties 的
++     * kraos 条目 + KraOSLinker 接管。
++     *
++     * **状态：占位，尚未实现。** KraELF 格式与加载器未定，当前只能产出占位产物。
++     */
++    object KRAOS_X64 : KonanTarget("kraos", Family.LINUX, Architecture.X64)
++
++    /**
++     * KraOS 内核目标：**freestanding**，无 libc、无 crt 启动文件、无动态链接器，
++     * 由 [KraOSLinker] 以自定义链接脚本（`-T`）直接落段。
++     *
++     * 与 [KRAOS_X64] 共用 [Family.LINUX] 与工具链，但走完全不同的链接分支：
++     * 内核有自己的入口 `_start_kraos`、固定加载基址与链接脚本。
++     */
++    object KRAOS_KERNEL_X64 : KonanTarget("kraos_kernel", Family.LINUX, Architecture.X64)
++
++    /**
+      * Removed targets. References are left just to provide a readable diagnostic message (as opposed to
+      * plain "unresolved reference error").
+      *
+@@ -83,7 +105,9 @@
+                 LINUX_X64,
+                 MINGW_X64,
+                 MACOS_X64, MACOS_ARM64,
+-                LINUX_ARM64, LINUX_ARM32_HFP
++                LINUX_ARM64, LINUX_ARM32_HFP,
++                KRAOS_X64,
++                KRAOS_KERNEL_X64
+             ).associateBy { it.name }
+         }
+ 
+--- a/native/utils/src/org/jetbrains/kotlin/konan/target/HostManager.kt
++++ b/native/utils/src/org/jetbrains/kotlin/konan/target/HostManager.kt
+@@ -57,6 +57,8 @@
+         ANDROID_X64,
+         ANDROID_ARM32,
+         ANDROID_ARM64,
++        KRAOS_X64,
++        KRAOS_KERNEL_X64,
+     )
+ 
+     private val appleTargets = setOf(
+--- a/native/utils/src/org/jetbrains/kotlin/konan/target/Configurables.kt
++++ b/native/utils/src/org/jetbrains/kotlin/konan/target/Configurables.kt
+@@ -137,4 +137,70 @@
+ interface ZephyrConfigurables : Configurables, ClangFlags {
+     val boardSpecificClangFlags get() = targetList("boardSpecificClangFlags")
+     val targetAbi get() = targetString("targetAbi")
++}
++
++/**
++ * KraOS 目标专有配置，覆盖两个目标：
++ *
++ * - `kraos_kernel` —— freestanding 内核。无 libc 启动、无 crt\*、无动态链接器，
++ *   由 [KraOSLinker] 以 `-T <链接脚本>` + 固定入口落段。
++ * - `kraos` —— 用户态，产出 KraELF（**占位，见 [KRAOS_X64]**）。
++ *
++ * 继承 [GccConfigurables] 是为了复用 x86_64-linux 已有的工具链/sysroot/静态库解析；
++ * 「与 Linux 的差异」全部收敛到下面这些 kraos\* 属性上，不污染上游定义。
++ */
++interface KraOSConfigurables : GccConfigurables {
++    /**
++     * 链接脚本（传给 `ld.lld -T`）。
++     *
++     * 支持绝对路径或相对 konan 依赖目录的路径；**留空则用 [KraOSLinkerScript] 的内置脚本**，
++     * 这样目标无需随发行版附带额外文件即可链接。
++     */
++    val kraosLinkerScript get() = targetString("kraosLinkerScript")
++
++    /** ELF 入口符号名，如 `_start_kraos`。 */
++    val kraosEntryPoint get() = targetString("kraosEntryPoint")!!
++
++    /**
++     * freestanding 开关。true（`kraos_kernel`）时链接不引入 crt 启动文件、
++     * 不加 `--dynamic-linker`/`--sysroot`，产物是无 PT_INTERP 的静态 ELF。
++     *
++     * false（`kraos`）时退化为普通 gnu 链接形状，给 KraELF 占位实现留退路。
++     */
++    val kraosFreestanding get() = targetString("kraosFreestanding")?.toBoolean() ?: true
++
++    /** KraELF 加载基址（十六进制字符串），`kraos` 目标用。 */
++    val kraosKraelfBase get() = targetString("kraosKraelfBase")
++
++    /** KraELF 头魔数（十六进制字符串），`kraos` 目标用。 */
++    val kraosKraelfMagic get() = targetString("kraosKraelfMagic")
++
++    /** 额外传给 `ld.lld` 的 `-L` 搜索目录列表。 */
++    val kraosExtraLinkerDirs get() = targetList("kraosExtraLinkerDirs")
++
++    /**
++     * 追加到链接行的裸目标文件（`.o`）列表，通常是内核启动桩。
++     *
++     * 之所以不走 konanc 的 `-Xinclude`：那个开关收的是**中间 klib**，
++     * 会和 Kotlin 源码一起走 IR 链接流程，而启动桩必须是已经编译好的机器码。
++     */
++    val kraosExtraObjects get() = targetList("kraosExtraObjects")
++
++    /**
++     * 追加到链接行的裸库标志（`-lc` 之类）。
++     *
++     * 刻意**不**复用 `linkerGccFlags`：那是个无后缀的全局默认键
++     * （`-lgcc --as-needed -lgcc_s ... -lc`），带 `--as-needed` 与动态库语义，
++     * 会把 freestanding 产物拖回动态链接。KraOS 需要自己点名每一个静态库。
++     */
++    val kraosLinkerExtraLibs get() = targetList("kraosLinkerExtraLibs")
++
++    /** 内核链接时排掉的库名（默认全排；freestanding 不链 libc）。 */
++    val kraosKernelExcludedLibs get() = targetList("kraosKernelExcludedLibs")
++
++    /** 内核物理加载地址（LMA），仅用于生成 [KraOSLinkerScript] 默认脚本。 */
++    val kraosLoadAddress get() = targetString("kraosLoadAddress") ?: "0x100000"
++
++    /** 内核虚拟地址（高半区 VMA），仅用于生成 [KraOSLinkerScript] 默认脚本。 */
++    val kraosVirtualAddress get() = targetString("kraosVirtualAddress") ?: "0xffffffff80000000"
+ }
+\ 文件末尾没有换行符
+--- a/native/utils/src/org/jetbrains/kotlin/konan/target/ConfigurablesImpl.kt
++++ b/native/utils/src/org/jetbrains/kotlin/konan/target/ConfigurablesImpl.kt
+@@ -28,6 +28,9 @@
+ class AndroidConfigurablesImpl(target: KonanTarget, properties: Properties, dependenciesRoot: String?, progressCallback: ProgressCallback) : AndroidConfigurables,
+     KonanPropertiesLoader(target, properties, dependenciesRoot, progressCallback = progressCallback)
+ 
++class KraOSConfigurablesImpl(target: KonanTarget, properties: Properties, dependenciesRoot: String?, progressCallback: ProgressCallback) : KraOSConfigurables,
++    KonanPropertiesLoader(target, properties, dependenciesRoot, progressCallback = progressCallback)
++
+ fun loadConfigurables(
+     target: KonanTarget,
+     properties: Properties,
+@@ -35,12 +38,19 @@
+     progressCallback: ProgressCallback = { url, currentBytes, totalBytes ->
+         print("\n(KonanProperties) Downloading dependency: $url (${currentBytes}/${totalBytes}). ")
+     },
+-): Configurables = when (target.family) {
+-    Family.LINUX -> GccConfigurablesImpl(target, properties, dependenciesRoot, progressCallback)
++): Configurables = when {
++    // KraOS 目标（kraos_kernel / kraos）复用 Family.LINUX 的工具链，但走独立的配置接口，
++    // 以便 KraOSLinker 能拿到链接脚本、入口符号等裸机参数。
++    target.name.startsWith("kraos") ->
++        KraOSConfigurablesImpl(target, properties, dependenciesRoot, progressCallback)
++
++    else -> when (target.family) {
++        Family.LINUX -> GccConfigurablesImpl(target, properties, dependenciesRoot, progressCallback)
+ 
+-    Family.TVOS, Family.WATCHOS, Family.IOS, Family.OSX -> AppleConfigurablesImpl(target, properties, dependenciesRoot, progressCallback)
++        Family.TVOS, Family.WATCHOS, Family.IOS, Family.OSX -> AppleConfigurablesImpl(target, properties, dependenciesRoot, progressCallback)
+ 
+-    Family.ANDROID -> AndroidConfigurablesImpl(target, properties, dependenciesRoot, progressCallback)
++        Family.ANDROID -> AndroidConfigurablesImpl(target, properties, dependenciesRoot, progressCallback)
+ 
+-    Family.MINGW -> MingwConfigurablesImpl(target, properties, dependenciesRoot, progressCallback)
++        Family.MINGW -> MingwConfigurablesImpl(target, properties, dependenciesRoot, progressCallback)
++    }
+ }
+--- a/native/utils/src/org/jetbrains/kotlin/konan/target/Linker.kt
++++ b/native/utils/src/org/jetbrains/kotlin/konan/target/Linker.kt
+@@ -442,6 +442,142 @@
+     }
+ }
+ 
++/**
++ * KraOS 链接器，服务两个目标：
++ *
++ * - **`kraos_kernel`（freestanding 内核）** —— 完全不走 gnu 启动约定：
++ *   不引入 `crt1.o`/`crti.o`/`crtbegin.o`/`crtend.o`/`crtn.o`，不加 `-dynamic-linker`、
++ *   `--sysroot`、`-export-dynamic`、`--eh-frame-hdr`；段布局与入口由 `-T <链接脚本>` 和
++ *   `--entry=<入口符号>` 决定（默认脚本见 [KraOSLinkerScript]，可由
++ *   `kraosLinkerScript` 属性覆盖）。产物是**全静态、无 PT_INTERP** 的 ELF。
++ *
++ * - **`kraos`（KraELF 用户态）** —— 占位实现。`kraosFreestanding=false` 时退化为
++ *   常规 gnu 链接形状，为将来 KraELF 头生成留出退路。
++ *
++ * 与 [GccBasedLinker] 共享工具链查找（`absoluteTargetToolchain`/`absoluteLlvmHome`）与
++ * `ar` 静态归档逻辑，差异全部收在 [finalLinkCommands] 里。
++ */
++class KraOSLinker(targetProperties: KraOSConfigurables)
++    : LinkerFlags(targetProperties), KraOSConfigurables by targetProperties {
++
++    private val ar = if (HostManager.hostIsLinux) {
++        "$absoluteTargetToolchain/bin/ar"
++    } else {
++        "$absoluteTargetToolchain/bin/llvm-ar"
++    }
++    override val libGcc = "$absoluteTargetSysRoot/${super.libGcc}"
++
++    private val specificLibs = abiSpecificLibraries.map { "-L${absoluteTargetSysRoot}/$it" }
++
++    /**
++     * `-T` 链接脚本路径。属性未配置时把 [KraOSLinkerScript] 的默认脚本写进本次链接的临时目录。
++     *
++     * 只在真正需要链接可执行文件时才求值，避免静态库构建凭空产生临时文件。
++     */
++    // 注意：本包里 File 默认解析到 org.jetbrains.kotlin.konan.file.File（Path 包装类，
++    // listFiles/exists 是属性）。这里需要 java.io.File 语义，故全部写全限定名。
++    private val linkerScript: java.io.File by lazy {
++        val configured = kraosLinkerScript
++        if (configured != null) {
++            java.io.File(absolute(configured))
++        } else {
++            KraOSLinkerScript.materialize(
++                directory = tempFilesDir(),
++                targetName = configurables.target.name,
++                entry = kraosEntryPoint,
++                loadAddress = kraosLoadAddress,
++                virtualAddress = kraosVirtualAddress,
++            )
++        }
++    }
++
++    private fun tempFilesDir(): java.io.File {
++        val dir = java.io.File(System.getProperty("java.io.tmpdir"), "kraos-linker-scripts")
++        dir.mkdirs()
++        return dir
++    }
++
++    override fun provideCompilerRtLibrary(libraryName: String, isDynamic: Boolean): String? {
++        require(!isDynamic) { "Dynamic compiler rt libraries are unsupported on KraOS" }
++        // 与 GccBasedLinker 同源：LLVM 11 之后产物名不再带版本后缀。
++        // 与上游不同的一点：找不到就返回 null —— 返回一个不存在的路径会让 ld.lld
++        // 直接以 "file not found" 失败，比缺一个内建库更难排查。
++        val clangdir = java.io.File("$absoluteLlvmHome/lib/clang/").listFiles()?.firstOrNull()?.absolutePath
++            ?: return null
++        val libdir = java.io.File("$clangdir/lib/").listFiles()?.firstOrNull()?.absolutePath
++            ?: return null
++        val versioned = java.io.File("$libdir/libclang_rt.$libraryName-x86_64.a")
++        if (versioned.exists()) return versioned.absolutePath
++        val plain = java.io.File("$libdir/libclang_rt.$libraryName.a")
++        return if (plain.exists()) plain.absolutePath else null
++    }
++
++    override fun filterStaticLibraries(binaries: List<String>) = binaries.filter { it.isUnixStaticLib }
++
++    /** freestanding 模式下剔除 `linkerKonanFlags` 里被 [kraosKernelExcludedLibs] 点名的 `-l`。 */
++    private fun kraosKonanFlags(): List<String> {
++        val excluded = kraosKernelExcludedLibs.map { it.removePrefix("-l") }.toSet()
++        return linkerKonanFlags.filter { flag ->
++            val name = flag.removePrefix("-l")
++            !flag.startsWith("-l") || name !in excluded
++        }
++    }
++
++    override fun LinkerArguments.finalLinkCommands(): List<Command> {
++        if (kind == LinkerOutputKind.STATIC_LIBRARY) {
++            require(sanitizer == null) { "Sanitizers are unsupported on KraOS" }
++            return staticGnuArCommands(ar, executable, objectFiles, libraries)
++        }
++        if (kind == LinkerOutputKind.DYNAMIC_LIBRARY) {
++            error("KraOS does not support dynamic libraries: ${configurables.target}")
++        }
++        require(sanitizer == null) { "Sanitizers are unsupported on KraOS (freestanding)" }
++
++        if (!kraosFreestanding) {
++            // kraos（KraELF）占位路径：gnu 形状，KraELF 头生成落地后替换为真实实现。
++            System.err.println(
++                "warning: target ${configurables.target} produces a plain ELF for now; " +
++                        "KraELF container generation is not implemented yet."
++            )
++        }
++
++        return listOf(Command(absoluteLinker).apply {
++            +"--entry=$kraosEntryPoint"
++            +"-T${linkerScript.absolutePath}"
++            +"--no-dynamic-linker"
++            +"-static"
++            +"-z"
++            +"noexecstack"
++            +"--gc-sections"
++            +"--build-id=sha1"
++            +"-o"
++            +executable
++            // freestanding 不需要 sysroot；但 hosted 占位路径（kraos）必须要：
++            // glibc 的 libpthread_nonshared.a 内含指向 /usr/lib64 的绝对 INPUT()，
++            // 没有 --sysroot 就会去访问宿主机的 /usr/lib64 而找不到文件。
++            if (!kraosFreestanding) +"--sysroot=${absoluteTargetSysRoot}"
++            +"-L$libGcc"
++            +specificLibs
++            +kraosExtraLinkerDirs.map { "-L$it" }
++            // 引导桩等非 Kotlin 目标文件。放在 objectFiles 之后，保证符号解析
++            // 时 Kotlin 侧生成的目标文件已经就位。
++            +kraosExtraObjects.map { java.io.File(it).absolutePath }
++            if (optimize) +linkerOptimizationFlags
++            if (!debug) +linkerNoDebugFlags
++            +objectFiles
++            +libraries
++            +linkerArgs
++            +kraosKonanFlags()
++            +kraosLinkerExtraLibs
++            // freestanding 下仍可能引用编译器内建（__udivti3 等）与 C++ ABI 符号；
++            // 自研运行时位码落地后可从 kraosKernelExcludedLibs 排掉对应 -l。
++            provideCompilerRtLibrary("builtins")?.let { +it }
++            +"-lgcc"
++            +"-lgcc_eh"
++        })
++    }
++}
++
+ class MingwLinker(targetProperties: MingwConfigurables)
+     : LinkerFlags(targetProperties), MingwConfigurables by targetProperties {
+ 
+@@ -510,6 +646,8 @@
+ 
+ fun linker(configurables: Configurables): LinkerFlags =
+         when (configurables) {
++            // 必须排在 GccConfigurables 之前：KraOSConfigurables 是它的子类型。
++            is KraOSConfigurables -> KraOSLinker(configurables)
+             is GccConfigurables -> GccBasedLinker(configurables)
+             is AppleConfigurables -> MacOSBasedLinker(configurables)
+             is AndroidConfigurables-> AndroidLinker(configurables)
+--- /dev/null
++++ b/native/utils/src/org/jetbrains/kotlin/konan/target/KraOSLinkerScript.kt
+@@ -0,0 +1,140 @@
++/*
++ * Copyright 2010-2024 JetBrains s.r.o.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.jetbrains.kotlin.konan.target
++
++import java.io.File
++
++/**
++ * KraOS 内核默认链接脚本（`ld.lld -T` 用）。
++ *
++ * 只在 konan.properties **未**提供 `kraosLinkerScript` 时启用：此时脚本由编译器现写到
++ * 临时目录再交给 ld.lld，`kraos_kernel` 因此无需随发行版附带任何额外文件即可链接。
++ * 一旦配置了 `kraosLinkerScript`，用户脚本原样生效，本对象完全不参与。
++ *
++ * 段布局要点：
++ *  - 高半区 VMA（内核虚拟地址）+ 低 LMA（引导器搬运的物理加载地址），二者分离；
++ *  - `.bss` 不占文件空间（NOBITS），内核按 `__bss_start`/`__bss_end` 自行清零；
++ *  - `.interp`/`.dynamic`/`.plt`/`.got` 一并丢弃 —— freestanding 没有动态链接器；
++ *  - `.init_array`/`.fini_array` 显式落段，避免 lld 当作 orphan section 塞到 `.bss` 之后。
++ */
++internal object KraOSLinkerScript {
++
++    /**
++     * 把默认脚本写到 [directory]，返回该文件。
++     *
++     * 文件名带 [targetName]：kraos 与 kraos_kernel 共用同一个临时目录，
++     * 固定文件名会让并发构建互相覆盖对方的布局参数。
++     */
++    fun materialize(directory: File, targetName: String, entry: String, loadAddress: String, virtualAddress: String): File =
++        File(directory, "$targetName.ld").apply { writeText(render(entry, loadAddress, virtualAddress)) }
++
++    fun render(entry: String, loadAddress: String, virtualAddress: String): String =
++        """
++        |/* Generated by KraOSLinkerScript — KraOS freestanding kernel link script.
++        | * Override by setting `kraosLinkerScript` in konan.properties.
++        | */
++        |ENTRY($entry)
++        |
++        |KERNEL_LMA = $loadAddress;
++        |KERNEL_VMA = $virtualAddress;
++        |
++        |SECTIONS
++        |{
++        |    . = KERNEL_LMA + KERNEL_VMA;
++        |    __kernel_start = .;
++        |
++        |    .text : ALIGN(4K)
++        |    {
++        |        KEEP(*(.text.boot))
++        |        *(.text .text.*)
++        |    }
++        |
++        |    .rodata : ALIGN(4K)
++        |    {
++        |        *(.rodata .rodata.*)
++        |    }
++        |
++        |    .init_array : ALIGN(8)
++        |    {
++        |        __init_array_start = .;
++        |        KEEP(*(SORT_BY_INIT_PRIORITY(.init_array.*) SORT_BY_INIT_PRIORITY(.ctors.*)))
++        |        KEEP(*(.init_array .ctors))
++        |        __init_array_end = .;
++        |    }
++        |
++        |    .fini_array : ALIGN(8)
++        |    {
++        |        __fini_array_start = .;
++        |        KEEP(*(SORT_BY_INIT_PRIORITY(.fini_array.*) SORT_BY_INIT_PRIORITY(.dtors.*)))
++        |        KEEP(*(.fini_array .dtors))
++        |        __fini_array_end = .;
++        |    }
++        |
++        |    .rela.iplt : ALIGN(8)
++        |    {
++        |        /* IRELATIVE（ifunc）重定位表。lld 对 glibc 里的 ifunc
++        |         * （memcpy/strlen/memmove 这些多版本实现）只生成 .iplt 桩，
++        |         * 桩体是「jmp *GOT 槽」，GOT 槽留到运行时再填。没有动态链接器
++        |         * 就没有人填，于是跳转直接跳到 0。这里把表留下来，
++        |         * 由引导代码调用 kraos_apply_irel() 逐条执行解析器。 */
++        |        __rela_iplt_start = .;
++        |        KEEP(*(.rela.iplt))
++        |        __rela_iplt_end = .;
++        |    }
++        |
++        |    .data : ALIGN(4K)
++        |    {
++        |        *(.data .data.*)
++        |    }
++        |
++        |    .bss : ALIGN(4K)
++        |    {
++        |        __bss_start = .;
++        |        *(.bss .bss.*)
++        |        *(COMMON)
++        |        . = ALIGN(4K);
++        |        __bss_end = .;
++        |    }
++        |
++        |    __kernel_end = .;
++        |    _end = .;
++        |    PROVIDE(end = .);
++        |
++        |    /DISCARD/ :
++        |    {
++        |        *(.comment)
++        |        *(.note .note.*)
++        |        *(.eh_frame)
++        |        *(.eh_frame_hdr)
++        |        *(.interp)
++        |        *(.dynamic)
++        |        *(.dynsym)
++        |        *(.dynstr)
++        |        *(.hash)
++        |        *(.gnu.hash)
++        |        *(.rela .rela.*)
++        |        *(.rel .rel.*)
++        |        *(.plt .plt.*)
++        |        *(.got .got.*)
++        |        *(.gnu.build.attributes)
++        |    }
++        |}
++        |
++        |ASSERT(ADDR(.text) == KERNEL_LMA + KERNEL_VMA, "kernel .text must land at LMA+VMA")
++        |
++        """.trimMargin()
++}
+--- a/kotlin-native/konan/konan.properties
++++ b/kotlin-native/konan/konan.properties
+@@ -1048,5 +1048,144 @@
+ # TODO: make explicit list of external symbols
+ lld.wasm32 = --allow-undefined --no-entry --global-base=0 --export-dynamic
+ 
++# KraOS targets.
++#
++# Two distinct targets, both reusing Family.LINUX for toolchain/sysroot resolution
++# but taking completely different paths at link time (see KraOSLinker in
++# native/utils/src/org/jetbrains/kotlin/konan/target/Linker.kt):
++#
++#   kraos_kernel  freestanding kernel: no libc startup, no crt*, no dynamic
++#                 linker, custom -T link script and _start entry. Emits a fully
++#                 static ELF with no PT_INTERP.
++#   kraos         user-space KraELF container -- PLACEHOLDER, not implemented yet.
++#
++# BOOTSTRAP CAVEAT: the toolchain below still borrows the same llvm-16-essentials
++# and gcc-8.3 sysroot bundles as linux_x64, and the runtime bitcode under
++# konan/targets/kraos*/native/ is still linux_x64's. So kraos_kernel today links a
++# static ELF that still contains glibc/pthread references. When the self-hosted
++# runtime bitcode lands, drop the crt/sysroot/libs entries and trim
++# kraosKernelExcludedLibs.
++
++# ---------------------------------------------------------------- shared --
++# Host-target keys use suffix "<host>-<target>"; see hostTargetString/hostTargetSuffix
++# (compiler/util-io/.../properties/Properties.kt) -- NOT the bare "<target>" form.
++
++llvmHome.linux_x64-kraos = llvm-16.0.0-x86_64-linux-essentials-80
++llvmHome.linux_x64-kraos_kernel = llvm-16.0.0-x86_64-linux-essentials-80
++targetToolchain.linux_x64-kraos = $gccToolchain.kraos/x86_64-unknown-linux-gnu
++targetToolchain.linux_x64-kraos_kernel = $gccToolchain.kraos_kernel/x86_64-unknown-linux-gnu
++linker.linux_x64-kraos = $llvmHome.linux_x64-kraos/bin/ld.lld
++linker.linux_x64-kraos_kernel = $llvmHome.linux_x64-kraos_kernel/bin/ld.lld
++linkerHostSpecificFlags.linux_x64-kraos =
++linkerHostSpecificFlags.linux_x64-kraos_kernel =
++
++dependencies.linux_x64-kraos = \
++    llvm-16.0.0-x86_64-linux-essentials-80 \
++    x86_64-unknown-linux-gnu-gcc-8.3.0-glibc-2.19-kernel-4.9-2
++dependencies.linux_x64-kraos_kernel = \
++    llvm-16.0.0-x86_64-linux-essentials-80 \
++    x86_64-unknown-linux-gnu-gcc-8.3.0-glibc-2.19-kernel-4.9-2
++
++llvmVersion.linux_x64-kraos = 16
++llvmVersion.linux_x64-kraos_kernel = 16
++
++# ------------------------------------------------------------ kraos_kernel --
++# Freestanding kernel.
++
++targetTriple.kraos_kernel = x86_64-unknown-linux-gnu
++targetCpu.kraos_kernel = x86-64
++# Do NOT add -mgeneral-regs-only: the K/N ABI uses xmm registers.
++targetCpuFeatures.kraos_kernel = +cx8,+fxsr,+mmx,+sse,+sse2,+x87
++
++# -ffreestanding / -fno-builtin tell clang not to assume a hosted libc is around;
++# -fno-stack-protector because the kernel has no __stack_chk_fail.
++clangFlags.kraos_kernel = -cc1 -emit-obj -disable-llvm-optzns -x ir -ffunction-sections -fdata-sections -ffreestanding -fno-builtin
++clangNooptFlags.kraos_kernel = -O1
++clangOptFlags.kraos_kernel = -O3
++clangDebugFlags.kraos_kernel = -O0
++
++dynamicLibraryRelocationMode.kraos_kernel = pic
++staticLibraryRelocationMode.kraos_kernel = pic
++
++gccToolchain.kraos_kernel = x86_64-unknown-linux-gnu-gcc-8.3.0-glibc-2.19-kernel-4.9-2
++targetSysRoot.kraos_kernel = $gccToolchain.kraos_kernel/x86_64-unknown-linux-gnu/sysroot
++libGcc.kraos_kernel = ../../lib/gcc/x86_64-unknown-linux-gnu/8.3.0
++crtFilesLocation.kraos_kernel = usr/lib
++abiSpecificLibraries.kraos_kernel = lib usr/lib ../lib64 lib64 usr/lib64
++dynamicLinker.kraos_kernel = /lib64/ld-linux-x86-64.so.2
++
++kraosFreestanding.kraos_kernel = true
++# ELF 入口是启动桩 _start（GRUB 跳这里）；它再调 Konan_main 进 K/N 运行时。
++kraosEntryPoint.kraos_kernel = _start
++# 16 MiB：OVMF 在 8~9 MiB 附近保留 ACPI NVS 区，镜像与引导堆都不能压进去。
++kraosLoadAddress.kraos_kernel = 0x1000000
++# 引导期把 VMA 放在低地址：借用的 glibc 静态归档（libc.a/libpthread.a）用
++# R_X86_64_32 绝对重定位，放不下 0xffffffff80000000 高半区，会报
++# "relocation R_X86_64_32 out of range"。自研运行时位码落地、静态 libc 被
++# 摘掉之后，把这里改回 0xffffffff80000000 即可切到高半区内核。
++kraosVirtualAddress.kraos_kernel = 0x0
++# 用项目自带的链接脚本：它要保留 .multiboot、.init_array 和 unwind 表，
++# 这些内置默认脚本为了通用性会丢弃或没有覆盖。
++kraosLinkerScript.kraos_kernel = /home/rj/KraOS/KraOS/boot/linker.ld
++# 引导桩是已经汇编好的机器码，走不了 konanc 的 -Xinclude（那个收的是 klib），
++# 由 KraOSLinker 直接追加到链接行。
++kraosExtraObjects.kraos_kernel = /home/rj/KraOS/KraOS/build/entry.o /home/rj/KraOS/KraOS/build/libc_shim.o /home/rj/KraOS/KraOS/build/ifunc_shim.o
++kraosKernelExcludedLibs.kraos_kernel =
++# BOOTSTRAP: 借用的 linux_x64 运行时仍引用 glibc/pthread/C++ ABI 符号，
++# 必须显式点名对应静态库（-L 来自 abiSpecificLibraries）。自研运行时位码
++# 落地后把这一行清空，即可得到零 libc 依赖的纯内核。
++kraosLinkerExtraLibs.kraos_kernel = -lstdc++ -lpthread -ldl -lc -lm
++
++# No -Bdynamic here: KraOSLinker drives ld.lld directly, and -Bdynamic would let it
++# pick shared objects and produce a dynamically linked image.
++linkerKonanFlags.kraos_kernel = --defsym __cxa_demangle=Konan_cxa_demangle --allow-multiple-definition
++linkerOptimizationFlags.kraos_kernel =
++linkerNoDebugFlags.kraos_kernel = -S
++linkerDynamicFlags.kraos_kernel =
++
++abiVersion.kraos_kernel = 1
++
++# ------------------------------------------------------------------ kraos --
++# User-space KraELF container. PLACEHOLDER: KraELF layout and the loader are not
++# designed yet, so this target currently emits a plain (gnu-shaped) ELF.
++
++targetTriple.kraos = x86_64-unknown-linux-gnu
++targetCpu.kraos = x86-64
++targetCpuFeatures.kraos = +cx8,+fxsr,+mmx,+sse,+sse2,+x87
++
++clangFlags.kraos = -cc1 -emit-obj -disable-llvm-optzns -x ir -ffunction-sections -fdata-sections
++clangNooptFlags.kraos = -O1
++clangOptFlags.kraos = -O3
++clangDebugFlags.kraos = -O0
++
++dynamicLibraryRelocationMode.kraos = pic
++staticLibraryRelocationMode.kraos = pic
++
++gccToolchain.kraos = x86_64-unknown-linux-gnu-gcc-8.3.0-glibc-2.19-kernel-4.9-2
++targetSysRoot.kraos = $gccToolchain.kraos/x86_64-unknown-linux-gnu/sysroot
++libGcc.kraos = ../../lib/gcc/x86_64-unknown-linux-gnu/8.3.0
++crtFilesLocation.kraos = usr/lib
++abiSpecificLibraries.kraos = lib usr/lib ../lib64 lib64 usr/lib64
++dynamicLinker.kraos = /lib64/ld-linux-x86-64.so.2
++
++kraosFreestanding.kraos = false
++kraosEntryPoint.kraos = Konan_main
++kraosKraelfBase.kraos = 0x400000
++kraosKraelfMagic.kraos = 0x4b52414f53
++# 引导期与 kraos_kernel 同理：借用的 glibc 静态归档用 R_X86_64_32 绝对重定位，
++# 加载地址必须留在 4G 以下。KraELF 加载器落地后再按容器格式重定。
++kraosLoadAddress.kraos = 0x400000
++kraosVirtualAddress.kraos = 0x0
++kraosLinkerExtraLibs.kraos = -lstdc++ -lpthread -ldl -lc -lm
++
++linkerKonanFlags.kraos = --defsym __cxa_demangle=Konan_cxa_demangle --allow-multiple-definition
++linkerOptimizationFlags.kraos =
++linkerNoDebugFlags.kraos = -S
++linkerDynamicFlags.kraos = -shared
++
++abiVersion.kraos = 1
++
++
++
+ # The version of Kotlin/Native compiler
+ compilerVersion=@compilerVersion@

@@ -1,0 +1,34 @@
+# 启动桩对 Kotlin 暴露的 ABI。
+#
+# 这些符号定义在 boot/entry.S 里（纯机器码），Kotlin 侧通过 cinterop 生成的绑定
+# 调用它们。之所以走 cinterop 而不是 @GCUnsafeCall / @SymbolName：后者在 2.1.x
+# 要么被禁用（KT-46649），要么要求一个 internal 的 opt-in 标记，用户代码引用不了。
+#
+# 只声明原型，不需要头文件。
+#
+# 注意：分隔线 `---` 之后是 C 声明区，那里不能出现 # 注释 —— cinterop 会把它们
+# 原样塞进生成的 .c 文件，clang 报 invalid preprocessing directive。
+
+package = kraos.boot
+
+---
+long kraos_arena_start();
+long kraos_arena_end();
+long kraos_mb_magic();
+long kraos_mb_info();
+void kraos_outb(int port, int value);
+int  kraos_inb(int port);
+void kraos_cli();
+void kraos_sti();
+void kraos_hlt();
+long kraos_cpu_count();
+long kraos_rdtsc();
+
+long kraos_alloc(long size);
+long kraos_heap_start();
+long kraos_heap_end();
+long kraos_break_value();
+long kraos_alloc_bytes();
+long kraos_alloc_count();
+long kraos_brk_impl(long addr);
+long kraos_sbrk_impl(long increment);
